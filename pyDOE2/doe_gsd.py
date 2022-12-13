@@ -1,9 +1,219 @@
 """
 Copyright (C) 2018 - Rickard Sjoegren
 """
-import itertools
+class _gsd:
+    
+    def __init__(
+        self,
+        levels:Iterable[int],
+        reduction:int,
+        progress_bar:callable = None,
+    ) -> None:
 
-import numpy as np
+        try:
+            levels = [*map(int, levels)]
+        except (ValueError, TypeError):
+            'levels has to be sequence of integers'
+
+        reduction = int(reduction)
+        assert reduction > 1, 'reduction has to be integer larger than 1'
+        self.levels = levels
+        self.reduction = reduction
+        self._intype_dict = {np.iinfo(d).max:d for d in (np.int8, np.int16, np.int32, np.int64)}
+        self.final_partitions = None
+        self._orthogonals_generated = False
+        self.progress = progress_bar
+
+
+    def get_optimal_intype(self, max_num:int) -> np.dtype: 
+        return self._intype_dict[min(size for size in self._intype_dict if max_num <= size)]        
+
+
+    def _make_partitions(
+        self,
+        levels:List[int], 
+        reduction:int,
+    ) -> List[List[list]]:
+
+        partitions = []
+        partitions_len = []
+        max_len = 0
+        for partition_i in range(1, reduction + 1):
+            partition = []
+            partitioncount = []
+            for num_levels in levels:
+                part = []
+                partcount = 0
+                for level_i in range(1, num_levels):
+                    index = partition_i + (level_i - 1) * reduction
+                    if index <= num_levels:
+                        part.append(index)
+                        partcount += 1
+                partition.append(part)
+                partitioncount.append(partcount)
+                if partcount > max_len:
+                    max_len = partcount
+            partitions.append(partition)
+            partitions_len.append(partitioncount)
+
+        try:
+            self.partitions = np.array(
+                partitions, 
+                dtype = self.get_optimal_intype(num_levels),
+            )
+#             self._partitions_len = np.full(
+#                 self.partitions.shape[:-1],
+#                 self.partitions.shape[-1],
+#             )
+        except ValueError:
+            self.partitions = np.array(partitions, dtype = object)
+#             nplen = np.vectorize(len)
+#             self._partitions_len = nplen(partitions)
+
+        self._partitions_len = np.array(
+            partitions_len, 
+            dtype = self.get_optimal_intype(max_len),
+        )
+
+        return self.partitions
+
+
+    def _make_latin_square(
+        self,
+        reduction:int,
+    ) -> np.ndarray:
+
+        rang = np.arange(0,reduction,dtype = self.get_optimal_intype(2*reduction))
+        self.latin_square = np.repeat(rang.reshape(1,-1),reduction,axis=0)
+        self.latin_square += rang.reshape(-1,1)
+        self.latin_square[self.latin_square >= reduction] -= reduction
+        return self.latin_square
+
+
+    def _make_orthogonal_arrays(
+        self,
+        latin_square:np.ndarray,
+        num_factors:int,
+    ) -> np.ndarray:
+
+        p = len(latin_square)
+        first_row = latin_square[0]
+        A_matrices = first_row.reshape(-1,1,1)
+        while A_matrices[0].shape[1] < num_factors:
+            A_matrices = np.array(
+                [np.vstack([np.hstack([np.repeat(constant, len(other_A))[:, np.newaxis], other_A]) 
+                for constant,other_A in zip(first_row, A_matrices[latin_square[n]])])
+                for n in range(A_matrices.shape[0])],
+                dtype = self.get_optimal_intype(latin_square.max()),
+            )
+        return A_matrices
+
+
+    def _generate_orthogonals(
+        self,
+    ) -> None:
+
+        if not self._orthogonals_generated:        
+            self.num_levels = len(self.levels)
+            self.partitions = self._make_partitions(self.levels, self.reduction)
+            self.latin_square = self._make_latin_square(self.reduction)
+            self.orthogonal_arrays = self._make_orthogonal_arrays(self.latin_square, self.num_levels)
+            self._orthogonals_generated = True
+
+
+    def _index_partitions(
+        self,
+        partitions:np.ndarray,
+        orthogonal_array:np.ndarray,
+        iter_wrapper:callable = None,
+    ) -> Iterable:
+
+        assert (len(partitions) == orthogonal_array.max() + 1 and not orthogonal_array.min()), \
+        'Orthogonal array indexing does not match partition structure'
+        col_indexer = np.arange(orthogonal_array.shape[1])
+        self._partitions_iter = partitions[orthogonal_array, col_indexer]
+        self._partitions_len_i = self._partitions_len[orthogonal_array, col_indexer]
+        self._partition_bool = np.bool_(self._partitions_iter).all(axis=-1)
+        if partitions.dtype != object:
+            self._partition_bool = self._partition_bool.all(axis=-1)
+        self._partitions_iter = self._partitions_iter[self._partition_bool]
+        self._partitions_len_i = self._partitions_len_i[self._partition_bool]
+        if iter_wrapper:
+            self._partitions_iter = iter_wrapper(self._partitions_iter)
+        return self._partitions_iter, self._partitions_len_i
+
+
+    def _map_partitions_to_design(
+        self,
+        partitions_iterable:Iterable,
+        num_levels:int,
+        partitions_len:np.ndarray,
+    ) -> np.ndarray:
+
+        num_experiments = partitions_len.prod(axis=-1).astype(np.int64).sum()
+        num_values = num_experiments * np.int64(num_levels)
+
+        if num_values > 100_000:
+            print('Parallel processing engaged')
+            self.final_experiments = iters.chain.from_iterable(
+                Parallel(n_jobs=-1)
+                (delayed(iters.product)(*row) for row in partitions_iterable)
+            )
+        else:
+            self.final_experiments = iters.chain.from_iterable(
+                iters.starmap(iters.product, partitions_iterable)
+            )
+
+        try:
+            self.final_experiments = np.fromiter(
+                iters.chain.from_iterable(self.final_experiments),
+                dtype = self.get_optimal_intype(num_levels),
+                count = num_values
+            ).reshape(num_experiments, num_levels) - 1
+            return self.final_experiments
+        except ValueError:
+            raise ValueError('reduction too large compared to factor levels')
+        except MemoryError:
+            raise MemoryError('Experimental matrix too large to be generated in a structured \
+            manner. Please use another method.')
+
+
+    def generate(
+        self,
+        n_return_designs:int = 1,
+    ) -> np.ndarray:
+
+        self.n_return_designs = int(n_return_designs)
+        assert self.n_return_designs, 'n_return_designs has to be a positive integer'
+        if not self._orthogonals_generated:
+            self._generate_orthogonals()
+
+        if self.n_return_designs > 1:
+            self.return_designs = []
+            for n,orthogonal_array in enumerate(self.orthogonal_arrays[:self.n_return_designs],1):
+                print(f'calculating design {n}')
+                partitions_iter, partitions_len = self._index_partitions(
+                    partitions = self.partitions,
+                    orthogonal_array = orthogonal_array,
+                    iter_wrapper = self.progress,
+                )
+                self.n_return_designs.append(self._map_partitions_to_design(
+                    partitions_iterable = partitions_iter, 
+                    num_levels = self.num_levels,
+                    partitions_len = partitions_len,
+                ))
+
+        else:
+            partitions_iter, partitions_len = self._index_partitions(
+                partitions = self.partitions,
+                orthogonal_array = self.orthogonal_arrays[0],
+                iter_wrapper = self.progress,
+            )
+            return self._map_partitions_to_design(
+                partitions_iterable = partitions_iter, 
+                num_levels = self.num_levels,
+                partitions_len = partitions_len,
+            )
 
 
 def gsd(levels, reduction, n=1):
@@ -114,107 +324,4 @@ def gsd(levels, reduction, n=1):
        2014, and issued August 29, 2017. http://www.google.se/patents/US9746850.
 
     """
-    try:
-        assert all(isinstance(v, int) for v in levels), \
-            'levels has to be sequence of integers'
-        assert isinstance(reduction, int) and reduction > 1, \
-            'reduction has to be integer larger than 1'
-        assert isinstance(n, int) and n > 0, \
-            'n has to be positive integer'
-    except AssertionError as e:
-        raise ValueError(e)
-
-    partitions = _make_partitions(levels, reduction)
-    latin_square = _make_latin_square(reduction)
-    ortogonal_arrays = _make_orthogonal_arrays(latin_square, len(levels))
-
-    try:
-        designs = [_map_partitions_to_design(partitions, oa) - 1 for oa in
-                   ortogonal_arrays]
-    except ValueError:
-        raise ValueError('reduction too large compared to factor levels')
-
-    if n == 1:
-        return designs[0]
-    else:
-        return designs[:n]
-
-
-def _make_orthogonal_arrays(latin_square, n_cols):
-    """
-    Augment latin-square to the specified number of columns to produce
-    an orthogonal array.
-    """
-    p = len(latin_square)
-
-    first_row = latin_square[0]
-    A_matrices = [np.array([[v]]) for v in first_row]
-
-    while A_matrices[0].shape[1] < n_cols:
-        new_A_matrices = list()
-
-        for i, A_matrix in enumerate(A_matrices):
-            sub_a = list()
-            for constant, other_A in zip(first_row,
-                                         np.array(A_matrices)[latin_square[i]]):
-                constant_vec = np.repeat(constant, len(other_A))[:, np.newaxis]
-                combined = np.hstack([constant_vec, other_A])
-                sub_a.append(combined)
-
-            new_A_matrices.append(np.vstack(sub_a))
-
-        A_matrices = new_A_matrices
-
-        if A_matrices[0].shape[1] == n_cols:
-            break
-
-    return A_matrices
-
-
-def _map_partitions_to_design(partitions, ortogonal_array):
-    """
-    Map partitioned factor to final design using orthogonal-array produced
-    by augmenting latin square.
-    """
-    assert len(
-        partitions) == ortogonal_array.max() + 1 and ortogonal_array.min() == 0, \
-        'Orthogonal array indexing does not match partition structure'
-
-    mappings = list()
-    for row in ortogonal_array:
-        if any(not partitions[p][factor] for factor, p in enumerate(row)):
-            continue
-
-        partition_sets = [partitions[p][factor] for factor, p in enumerate(row)]
-        mapping = list(itertools.product(*partition_sets))
-        mappings.append(mapping)
-
-    return np.vstack(mappings)
-
-
-def _make_partitions(factor_levels, num_partitions):
-    """
-    Balanced partitioning of factors.
-    """
-    partitions = list()
-    for partition_i in range(1, num_partitions + 1):
-        partition = list()
-
-        for num_levels in factor_levels:
-            part = list()
-            for level_i in range(1, num_levels):
-                index = partition_i + (level_i - 1) * num_partitions
-                if index <= num_levels:
-                    part.append(index)
-
-            partition.append(part)
-
-        partitions.append(partition)
-
-    return partitions
-
-
-def _make_latin_square(n):
-    numbers = np.arange(n)
-    latin_square = np.vstack([np.roll(numbers, -i) for i in range(n)])
-    return latin_square
+    return _gsd(levels, reduction).generate(n_return_designs = n)
